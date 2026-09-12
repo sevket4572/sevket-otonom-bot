@@ -148,7 +148,7 @@ async def yardim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.callback_query:
         await update.callback_query.message.reply_text(rehber, parse_mode="Markdown")
 
-def main():
+async def run_bot():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     app = ApplicationBuilder().token(token).build()
 
@@ -162,7 +162,22 @@ def main():
     app.add_handler(CommandHandler("yardim", yardim))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    
+    # Sürekli çalışır durumda tut
+    while True:
+        await asyncio.sleep(3600)
+
+def main():
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_bot())
 
 if __name__ == "__main__":
     main()
+
