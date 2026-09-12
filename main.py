@@ -3,8 +3,10 @@ import asyncio
 import threading
 import sqlite3
 import datetime
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
+import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -15,32 +17,46 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ==========================================
-# 1. RENDER PORT & HEALTH CHECK SUNUCUSU
-# ==========================================
+# -------------------------------------------------------------
+# 1. RENDER PORT VE CANLILIK KORUMASI (HEALTH CHECK)
+# -------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Sevket Otonom Bot 7/24 Aktif!")
+        self.wfile.write(b"Sekreter Multi-Tool Engine Aktif!")
 
-def run_web_server():
+def start_health_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-threading.Thread(target=run_web_server, daemon=True).start()
+threading.Thread(target=start_health_server, daemon=True).start()
 
-# ==========================================
-# 2. SQLITE VERİTABANI YÖNETİMİ (KALICI HAFIZA)
-# ==========================================
-DB_FILE = "bot_database.db"
+# -------------------------------------------------------------
+# 2. ÇOK KULLANICILI SQLITE VERİTABANI
+# -------------------------------------------------------------
+DB_FILE = "sekreter_v2.db"
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        # Notlar Tablosu
-        cursor.execute("""
+    with get_db() as conn:
+        c = conn.cursor()
+        # Kullanıcı tercihleri
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                city TEXT DEFAULT 'Istanbul',
+                daily_report INTEGER DEFAULT 0,
+                report_time TEXT DEFAULT '08:30'
+            )
+        """)
+        # Notlar
+        c.execute("""
             CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -48,197 +64,160 @@ def init_db():
                 created_at TEXT
             )
         """)
-        # Görevler Tablosu
-        cursor.execute("""
+        # Görevler
+        c.execute("""
             CREATE TABLE IF NOT EXISTS todos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 task TEXT,
-                status TEXT
+                status TEXT DEFAULT 'PENDING'
             )
         """)
-        # Fiyat Alarmları Tablosu
-        cursor.execute("""
+        # Fiyat Alarmları
+        c.execute("""
             CREATE TABLE IF NOT EXISTS price_alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 chat_id INTEGER,
                 symbol TEXT,
                 target_price REAL,
-                condition TEXT,
-                status TEXT
+                direction TEXT,
+                status TEXT DEFAULT 'ACTIVE'
             )
         """)
         conn.commit()
 
 init_db()
 
-# ==========================================
-# 3. VERİ ÇEKME & SERVİSLER
-# ==========================================
-def get_crypto_summary():
-    try:
-        symbols = [("BTCUSDT", "BTC"), ("ETHUSDT", "ETH"), ("SOLUSDT", "SOL"), ("BNBUSDT", "BNB")]
-        lines = ["🪙 *Kripto Para Piyasası (Canlı)*\n"]
-        for sym, name in symbols:
-            url = f"https://api.binance.com/api/v3/ticker/price?symbol={sym}"
-            res = requests.get(url, timeout=5).json()
-            p = float(res["price"])
-            lines.append(f"• *{name}:* ${p:,.2f}")
-        return "\n".join(lines)
-    except Exception:
-        return "⚠️ Kripto piyasa verisi alınamadı."
+# -------------------------------------------------------------
+# 3. VERİ & API YARDIMCILARI
+# -------------------------------------------------------------
+def fetch_crypto():
+    symbols = [("BTCUSDT", "Bitcoin"), ("ETHUSDT", "Ethereum"), ("SOLUSDT", "Solana"), ("BNBUSDT", "BNB")]
+    lines = ["🪙 *Kripto Piyasası (Canlı)*\n"]
+    for sym, name in symbols:
+        try:
+            r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}", timeout=4).json()
+            lines.append(f"• *{name} ({sym[:3]}):* ${float(r['price']):,.2f}")
+        except Exception:
+            lines.append(f"• *{name}:* Veri alınamadı")
+    return "\n".join(lines)
 
-def get_fiat_summary():
+def fetch_fiat():
     try:
-        url = "https://open.er-api.com/v6/latest/USD"
-        res = requests.get(url, timeout=5).json()
-        rates = res.get("rates", {})
-        try_rate = rates.get("TRY", 0)
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=4).json()
+        rates = r.get("rates", {})
+        usd_try = rates.get("TRY", 0)
         eur_usd = rates.get("EUR", 1)
-        eur_try = try_rate / eur_usd if eur_usd else 0
+        eur_try = usd_try / eur_usd if eur_usd else 0
+        gbp_usd = rates.get("GBP", 1)
+        gbp_try = usd_try / gbp_usd if gbp_usd else 0
         
         return (
-            "💵 *Döviz Kurları (Serbest Piyasa)*\n\n"
-            f"• *USD / TRY:* ₺{try_rate:.2f}\n"
-            f"• *EUR / TRY:* ₺{eur_try:.2f}"
+            "💵 *Döviz Piyasası*\n\n"
+            f"• *USD / TRY:* ₺{usd_try:.2f}\n"
+            f"• *EUR / TRY:* ₺{eur_try:.2f}\n"
+            f"• *GBP / TRY:* ₺{gbp_try:.2f}"
         )
     except Exception:
-        return "⚠️ Döviz kuru verisi şu an alınamadı."
+        return "⚠️ Döviz kurlarına erişilemedi."
 
-def get_weather_report(city_name="Istanbul"):
+def fetch_weather(city="Istanbul"):
     try:
-        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city_name}&count=1&language=tr&format=json"
-        geo_res = requests.get(geo_url, timeout=5).json()
-        if not geo_res.get("results"):
-            return f"❌ '{city_name}' şehri bulunamadı."
-        
-        loc = geo_res["results"][0]
-        lat, lon = loc["latitude"], loc["longitude"]
-        name = loc["name"]
-        country = loc.get("country", "")
-
-        weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
-        w_res = requests.get(weather_url, timeout=5).json()
-        current = w_res.get("current_weather", {})
-        temp = current.get("temperature", "N/A")
-        wind = current.get("windspeed", "N/A")
-
-        return f"🌤 *Hava Durumu: {name}, {country}*\n\n• Sıcaklık: *{temp}°C*\n• Rüzgar Hızı: *{wind} km/s*"
+        geo = requests.get(f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=tr&format=json", timeout=4).json()
+        if not geo.get("results"):
+            return f"❌ '{city}' bulunamadı."
+        res = geo["results"][0]
+        lat, lon, name = res["latitude"], res["longitude"], res["name"]
+        w = requests.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true", timeout=4).json()
+        cw = w.get("current_weather", {})
+        return (
+            f"🌤 *Hava Durumu: {name}*\n\n"
+            f"• Sıcaklık: *{cw.get('temperature', 'N/A')}°C*\n"
+            f"• Rüzgar Hızı: *{cw.get('windspeed', 'N/A')} km/s*"
+        )
     except Exception:
         return "⚠️ Hava durumu servisine ulaşılamadı."
 
-# ==========================================
-# 4. KLAVYELER & MENÜLER
-# ==========================================
-def main_menu_keyboard():
+# -------------------------------------------------------------
+# 4. ARAYÜZ (İNTERAKTİF BUTONLAR)
+# -------------------------------------------------------------
+def get_main_panel():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📊 Kripto", callback_data="m_crypto"),
-            InlineKeyboardButton("💵 Döviz", callback_data="m_fiat"),
+            InlineKeyboardButton("📊 Kripto", callback_data="btn_crypto"),
+            InlineKeyboardButton("💵 Döviz", callback_data="btn_fiat"),
         ],
         [
-            InlineKeyboardButton("📝 Notlarım", callback_data="m_notes"),
-            InlineKeyboardButton("📋 Görevler", callback_data="m_todos"),
+            InlineKeyboardButton("📝 Notlar", callback_data="btn_notes"),
+            InlineKeyboardButton("📋 Görevler", callback_data="btn_todos"),
         ],
         [
-            InlineKeyboardButton("🌤 Hava Durumu", callback_data="m_weather"),
-            InlineKeyboardButton("⏰ Alarmlar", callback_data="m_alerts"),
+            InlineKeyboardButton("🌤 Hava Durumu", callback_data="btn_weather"),
+            InlineKeyboardButton("⚙️ Otonom Rapor", callback_data="btn_toggle_report"),
         ],
         [
-            InlineKeyboardButton("📖 Komut Rehberi", callback_data="m_help")
+            InlineKeyboardButton("ℹ️ Tüm Komutlar", callback_data="btn_help")
         ]
     ])
 
-# ==========================================
-# 5. KOMUTLAR VE CALLBACK HANDLERLAR
-# ==========================================
+# -------------------------------------------------------------
+# 5. KOMUTLAR
+# -------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    with get_db() as conn:
+        conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+        conn.commit()
+
     text = (
-        "🤖 *Şevket Otonom Asistan Paneline Hoş Geldiniz!*\n\n"
-        "Aşağıdaki kontrol panelinden dilediğiniz işlemi başlatabilir, "
-        "notlarınızı yönetebilir veya otonom alarmlar kurabilirsiniz."
+        "⚡️ *Sekreter Otonom Asistan Terminali*\n\n"
+        "Gelişmiş piyasa takibi, zamanlayıcılar, kalıcı veritabanı ve genel araçlar devrede. "
+        "Doğrudan butonlardan veya komut listesinden yönetebilirsiniz."
     )
     if update.message:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_main_panel())
     elif update.callback_query:
-        await update.callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await update.callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=get_main_panel())
 
-async def callback_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    uid = query.from_user.id
+async def piyasa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"{fetch_crypto()}\n\n{fetch_fiat()}", parse_mode="Markdown")
 
-    if data == "m_main":
-        await start(update, context)
-    elif data == "m_crypto":
-        await query.message.reply_text(get_crypto_summary(), parse_mode="Markdown")
-    elif data == "m_fiat":
-        await query.message.reply_text(get_fiat_summary(), parse_mode="Markdown")
-    elif data == "m_weather":
-        await query.message.reply_text(get_weather_report("Istanbul"), parse_mode="Markdown")
-    elif data == "m_notes":
-        with sqlite3.connect(DB_FILE) as conn:
-            c = conn.cursor()
-            c.execute("SELECT id, content FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 10", (uid,))
-            rows = c.fetchall()
-        if not rows:
-            await query.message.reply_text("📌 Henüz kayıtlı notunuz yok.\nEkleme: `/not_al <metin>`", parse_mode="Markdown")
-        else:
-            text = "📌 *Kayıtlı Notlarınız:*\n\n" + "\n".join([f"• {r[1]}" for r in rows])
-            await query.message.reply_text(text, parse_mode="Markdown")
-    elif data == "m_todos":
-        await show_todos_interactive(query.message, uid)
-    elif data == "m_alerts":
-        with sqlite3.connect(DB_FILE) as conn:
-            c = conn.cursor()
-            c.execute("SELECT id, symbol, target_price, condition FROM price_alerts WHERE user_id = ? AND status = 'ACTIVE'", (uid,))
-            rows = c.fetchall()
-        if not rows:
-            await query.message.reply_text("⏰ Aktif fiyat alarmınız bulunmuyor.\nÖrnek alarm: `/alarm btc 65000`", parse_mode="Markdown")
-        else:
-            text = "🔔 *Aktif Fiyat Alarmlarınız:*\n\n" + "\n".join([f"• #{r[0]} | {r[1].upper()} Hedef: ${r[2]:,.2f} ({r[3]})" for r in rows])
-            await query.message.reply_text(text, parse_mode="Markdown")
-    elif data == "m_help":
-        await yardim(update, context)
-    elif data.startswith("del_todo_"):
-        todo_id = int(data.split("_")[2])
-        with sqlite3.connect(DB_FILE) as conn:
-            c = conn.cursor()
-            c.execute("DELETE FROM todos WHERE id = ? AND user_id = ?", (todo_id, uid))
-            conn.commit()
-        await query.message.reply_text("✅ Görev tamamlandı ve silindi!")
-        await show_todos_interactive(query.message, uid)
+async def hava(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    city = " ".join(context.args) if context.args else "Istanbul"
+    await update.message.reply_text(fetch_weather(city), parse_mode="Markdown")
 
-async def show_todos_interactive(message, uid):
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        c.execute("SELECT id, task FROM todos WHERE user_id = ? AND status = 'PENDING'", (uid,))
-        rows = c.fetchall()
-    
-    if not rows:
-        await message.reply_text("📋 Bekleyen hiçbir göreviniz yok!\nGörev eklemek için: `/gorev_ekle <iş>`", parse_mode="Markdown")
+async def qr_kod(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    content = " ".join(context.args)
+    if not content:
+        await update.message.reply_text("Kullanım: `/qr <metin veya link>`", parse_mode="Markdown")
         return
+    encoded = urllib.parse.quote(content)
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={encoded}"
+    await update.message.reply_photo(photo=qr_url, caption=f"🏁 QR Kodunuz:\n`{content}`", parse_mode="Markdown")
 
-    text = "📋 *Aktif Yapılacaklar Listeniz:*\n(Tamamlanan görevi silmek için butonuna basabilirsiniz)\n"
-    buttons = []
-    for r in rows:
-        btn_text = f"❌ Sil: {r[1][:20]}"
-        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"del_todo_{r[0]}")])
-    
-    keyboard = InlineKeyboardMarkup(buttons)
-    await message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+async def hesapla(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    expr = "".join(context.args)
+    if not expr:
+        await update.message.reply_text("Kullanım: `/hesapla 25*4 + 10`", parse_mode="Markdown")
+        return
+    allowed = set("0123456789+-*/()., ")
+    if not set(expr).issubset(allowed):
+        await update.message.reply_text("❌ Geçersiz karakter! Yalnızca temel matematiksel ifadeler desteklenir.")
+        return
+    try:
+        clean_expr = expr.replace(",", ".")
+        res = eval(clean_expr, {"__builtins__": None}, {})
+        await update.message.reply_text(f"🔢 *Sonuç:* `{res}`", parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text("❌ Hatalı matematik ifadesi.")
 
-# ==========================================
-# 6. ZAMAN AYARLI HATIRLATICI (JOB QUEUE)
-# ==========================================
 async def hatirlat_callback(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     await context.bot.send_message(
         chat_id=job.chat_id,
-        text=f"⏰ *ZAMAN DOLDU!*\n\n🔔 Hatırlatıcı: *{job.data}*",
-        parse_mode="Markdown",
+        text=f"⏰ *ZAMAN DOLDU!*\n\n🔔 Bildirim: *{job.data}*",
+        parse_mode="Markdown"
     )
 
 async def hatirlat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,98 +228,53 @@ async def hatirlat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.job_queue.run_once(hatirlat_callback, saniye, chat_id=update.effective_chat.id, data=mesaj)
         await update.message.reply_text(f"✅ *{dk} dakika* sonra bildirim kuruldu:\n🎯 '{mesaj}'", parse_mode="Markdown")
     except (IndexError, ValueError):
-        await update.message.reply_text("Kullanım: `/hatirlat <dakika> <mesaj>`\nÖrn: `/hatirlat 15 Spor yap`", parse_mode="Markdown")
+        await update.message.reply_text("Kullanım: `/hatirlat <dakika> <mesaj>`\nÖrn: `/hatirlat 10 Su iç`", parse_mode="Markdown")
 
-# ==========================================
-# 7. OTONOM KRİPTO FİYAT ALARMI (ARKAPLAN TAKİP)
-# ==========================================
 async def alarm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         coin = context.args[0].upper()
         target = float(context.args[1])
         symbol = f"{coin}USDT"
         
-        # Güncel fiyatı kontrol et
-        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-        res = requests.get(url, timeout=5).json()
-        current = float(res["price"])
-        condition = "ABOVE" if target > current else "BELOW"
+        r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=4).json()
+        current = float(r["price"])
+        direction = "ABOVE" if target > current else "BELOW"
 
-        with sqlite3.connect(DB_FILE) as conn:
-            c = conn.cursor()
-            c.execute(
-                "INSERT INTO price_alerts (user_id, chat_id, symbol, target_price, condition, status) VALUES (?, ?, ?, ?, ?, 'ACTIVE')",
-                (update.effective_user.id, update.effective_chat.id, symbol, target, condition)
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO price_alerts (user_id, chat_id, symbol, target_price, direction, status) VALUES (?, ?, ?, ?, ?, 'ACTIVE')",
+                (update.effective_user.id, update.effective_chat.id, symbol, target, direction)
             )
             conn.commit()
 
-        yon = "üzerine çıktığında" if condition == "ABOVE" else "altına indiğinde"
+        txt_dir = "üzerine çıktığında" if direction == "ABOVE" else "altına indiğinde"
         await update.message.reply_text(
-            f"🎯 *Alarm Kuruldu!*\n\n• Parite: *{symbol}*\n• Şimdiki Fiyat: *${current:,.2f}*\n• Hedef: *${target:,.2f}*\n\nFiyat bu seviyenin {yon} bot otomatik mesaj atacak.",
+            f"🎯 *Alarm Kaydedildi!*\n\n• Parite: *{symbol}*\n• Şimdiki Değer: *${current:,.2f}*\n• Hedef Değer: *${target:,.2f}*\n\nFiyat hedefe vardığında otomatik bildirim gelecektir.",
             parse_mode="Markdown"
         )
     except Exception:
-        await update.message.reply_text("Kullanım: `/alarm <coin> <hedef_fiyat>`\nÖrnek: `/alarm btc 65000`", parse_mode="Markdown")
+        await update.message.reply_text("Kullanım: `/alarm <coin> <hedef_fiyat>`\nÖrn: `/alarm btc 68000`", parse_mode="Markdown")
 
-# Periyodik Takipçi (Job Queue ile 60 saniyede bir çalışır)
-async def price_watcher_job(context: ContextTypes.DEFAULT_TYPE):
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        c.execute("SELECT id, chat_id, symbol, target_price, condition FROM price_alerts WHERE status = 'ACTIVE'")
-        alerts = c.fetchall()
-
-    for alert in alerts:
-        aid, chat_id, sym, target, cond = alert
-        try:
-            url = f"https://api.binance.com/api/v3/ticker/price?symbol={sym}"
-            res = requests.get(url, timeout=5).json()
-            curr = float(res["price"])
-
-            triggered = False
-            if cond == "ABOVE" and curr >= target:
-                triggered = True
-            elif cond == "BELOW" and curr <= target:
-                triggered = True
-
-            if triggered:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🚨 *FİYAT ALARMI ÇALDI!*\n\n*{sym}* hedefe ulaştı!\n• Güncel Fiyat: *${curr:,.2f}*\n• Hedefiniz: *${target:,.2f}*",
-                    parse_mode="Markdown"
-                )
-                with sqlite3.connect(DB_FILE) as conn2:
-                    c2 = conn2.cursor()
-                    c2.execute("UPDATE price_alerts SET status = 'TRIGGERED' WHERE id = ?", (aid,))
-                    conn2.commit()
-        except Exception:
-            pass
-
-# ==========================================
-# 8. DİĞER KOMUTLAR
-# ==========================================
 async def not_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    metin = " ".join(context.args)
-    if not metin:
-        await update.message.reply_text("Kullanım: `/not_al <kaydedilecek not>`", parse_mode="Markdown")
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("Kullanım: `/not_al <metin>`", parse_mode="Markdown")
         return
     uid = update.effective_user.id
     now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        c.execute("INSERT INTO notes (user_id, content, created_at) VALUES (?, ?, ?)", (uid, metin, now))
+    with get_db() as conn:
+        conn.execute("INSERT INTO notes (user_id, content, created_at) VALUES (?, ?, ?)", (uid, text, now))
         conn.commit()
-    await update.message.reply_text("📌 Notunuz kalıcı belleğe kaydedildi!", parse_mode="Markdown")
+    await update.message.reply_text("📌 Not kalıcı veritabanına kaydedildi!", parse_mode="Markdown")
 
 async def notlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        c.execute("SELECT content, created_at FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 10", (uid,))
-        rows = c.fetchall()
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, content, created_at FROM notes WHERE user_id = ? ORDER BY id DESC LIMIT 10", (uid,)).fetchall()
     if not rows:
         await update.message.reply_text("📌 Kayıtlı notunuz yok.", parse_mode="Markdown")
     else:
-        text = "📌 *Son Notlarınız:*\n\n" + "\n".join([f"• {r[0]} _({r[1]})_" for r in rows])
+        text = "📌 *Son Notlarınız:*\n\n" + "\n".join([f"• {r['content']} _({r['created_at']})_" for r in rows])
         await update.message.reply_text(text, parse_mode="Markdown")
 
 async def gorev_ekle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -349,76 +283,144 @@ async def gorev_ekle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Kullanım: `/gorev_ekle <görev adı>`", parse_mode="Markdown")
         return
     uid = update.effective_user.id
-    with sqlite3.connect(DB_FILE) as conn:
-        c = conn.cursor()
-        c.execute("INSERT INTO todos (user_id, task, status) VALUES (?, ?, 'PENDING')", (uid, task))
+    with get_db() as conn:
+        conn.execute("INSERT INTO todos (user_id, task, status) VALUES (?, ?, 'PENDING')", (uid, task))
         conn.commit()
-    await update.message.reply_text("✅ Görev yapılacaklar listesine eklendi!", parse_mode="Markdown")
+    await update.message.reply_text("✅ Görev listenize eklendi!", parse_mode="Markdown")
+
+async def render_todos(message, uid):
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, task FROM todos WHERE user_id = ? AND status = 'PENDING'", (uid,)).fetchall()
+    if not rows:
+        await message.reply_text("📋 Bekleyen hiçbir göreviniz yok!")
+        return
+    buttons = [[InlineKeyboardButton(f"✅ Bitir: {r['task'][:22]}", callback_data=f"done_todo_{r['id']}")] for r in rows]
+    await message.reply_text("📋 *Aktif Görevleriniz:*\n(Tamamlamak için tıklayın)", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def gorevler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_todos_interactive(update.message, update.effective_user.id)
+    await render_todos(update.message, update.effective_user.id)
 
-async def hava(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    city = " ".join(context.args) if context.args else "Istanbul"
-    await update.message.reply_text(get_weather_report(city), parse_mode="Markdown")
-
-async def piyasa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(get_crypto_summary(), parse_mode="Markdown")
-
-async def doviz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(get_fiat_summary(), parse_mode="Markdown")
+async def oto_rapor_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    with get_db() as conn:
+        row = conn.execute("SELECT daily_report FROM users WHERE user_id = ?", (uid,)).fetchone()
+        current = row["daily_report"] if row else 0
+        new_val = 0 if current == 1 else 1
+        conn.execute("UPDATE users SET daily_report = ? WHERE user_id = ?", (new_val, uid))
+        conn.commit()
+    status_str = "AÇILDI 🟢" if new_val == 1 else "KAPATILDI 🔴"
+    msg = f"⚙️ Günlük otomatik sabah raporu: *{status_str}*"
+    if update.message:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(msg, parse_mode="Markdown")
 
 async def yardim(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rehber = (
-        "📖 *Otonom Bot Komut Kılavuzu:*\n\n"
-        "• `/start` - Ana kontrol panelini açar\n"
-        "• `/hatirlat <dk> <iş>` - Geri sayım sayacı kurar\n"
-        "• `/alarm <coin> <fiyat>` - Otomatik fiyat alarmı kurar (Örn: `/alarm btc 64000`)\n"
-        "• `/piyasa` - Kripto piyasa fiyatlarını getirir\n"
-        "• `/doviz` - Dolar ve Euro kurlarını getirir\n"
+    text = (
+        "📖 *Sekreter Multi-Tool Komut Listesi:*\n\n"
+        "• `/start` - Ana butonlu paneli açar\n"
+        "• `/piyasa` - Kripto ve döviz piyasalarını listeler\n"
+        "• `/alarm <coin> <fiyat>` - Otonom fiyat alarmı kurar\n"
+        "• `/hatirlat <dk> <mesaj>` - Geri sayım sayacı kurar\n"
         "• `/hava <şehir>` - Anlık hava durumunu çeker\n"
-        "• `/not_al <metin>` - Kalıcı not kaydeder\n"
-        "• `/notlar` - Kayıtlı notları listeler\n"
-        "• `/gorev_ekle <iş>` - Yapılacaklar listesine iş ekler\n"
-        "• `/gorevler` - Görevleri etkileşimli listeler"
+        "• `/qr <yazı veya link>` - Taranabilir QR kod üretir\n"
+        "• `/hesapla <işlem>` - Matematiksel işlem yapar\n"
+        "• `/not_al <not>` & `/notlar` - Kalıcı not yöneticisi\n"
+        "• `/gorev_ekle <iş>` & `/gorevler` - Butonlu görev listesi\n"
+        "• `/oto_rapor` - Otomatik sabah brifingini açar/kapatır"
     )
     if update.message:
-        await update.message.reply_text(rehber, parse_mode="Markdown")
+        await update.message.reply_text(text, parse_mode="Markdown")
     elif update.callback_query:
-        await update.callback_query.message.reply_text(rehber, parse_mode="Markdown")
+        await update.callback_query.message.reply_text(text, parse_mode="Markdown")
 
-async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.lower()
-    if any(w in txt for w in ["selam", "merhaba", "sa", "hey", "naber"]):
-        await update.message.reply_text("👋 Selam! Kontrol paneline erişmek için aşağıdaki butonları kullanabilirsin:", reply_markup=main_menu_keyboard())
-    else:
-        await update.message.reply_text("⚙️ İşlem yapmak için menüyü veya `/yardim` komutunu kullanabilirsiniz.", reply_markup=main_menu_keyboard())
+# -------------------------------------------------------------
+# 6. BUTON YÖNLENDİRİCİSİ
+# -------------------------------------------------------------
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    uid = query.from_user.id
 
-# ==========================================
-# 9. UYGULAMA MOTORU VE BAŞLATMA
-# ==========================================
+    if data == "btn_crypto":
+        await query.message.reply_text(fetch_crypto(), parse_mode="Markdown")
+    elif data == "btn_fiat":
+        await query.message.reply_text(fetch_fiat(), parse_mode="Markdown")
+    elif data == "btn_weather":
+        await query.message.reply_text(fetch_weather("Istanbul"), parse_mode="Markdown")
+    elif data == "btn_notes":
+        await notlar(update, context)
+    elif data == "btn_todos":
+        await render_todos(query.message, uid)
+    elif data == "btn_toggle_report":
+        await oto_rapor_toggle(update, context)
+    elif data == "btn_help":
+        await yardim(update, context)
+    elif data.startswith("done_todo_"):
+        tid = int(data.split("_")[2])
+        with get_db() as conn:
+            conn.execute("UPDATE todos SET status = 'COMPLETED' WHERE id = ? AND user_id = ?", (tid, uid))
+            conn.commit()
+        await query.message.reply_text("✅ Görev tamamlandı!")
+        await render_todos(query.message, uid)
+
+# -------------------------------------------------------------
+# 7. PERİYODİK OTONOM GÖREVLER (BACKGROUND WORKER)
+# -------------------------------------------------------------
+async def price_alert_worker(context: ContextTypes.DEFAULT_TYPE):
+    with get_db() as conn:
+        alerts = conn.execute("SELECT id, chat_id, symbol, target_price, direction FROM price_alerts WHERE status = 'ACTIVE'").fetchall()
+    
+    for a in alerts:
+        try:
+            r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={a['symbol']}", timeout=3).json()
+            curr = float(r["price"])
+            triggered = False
+            if a["direction"] == "ABOVE" and curr >= a["target_price"]:
+                triggered = True
+            elif a["direction"] == "BELOW" and curr <= a["target_price"]:
+                triggered = True
+
+            if triggered:
+                await context.bot.send_message(
+                    chat_id=a["chat_id"],
+                    text=f"🚨 *FİYAT ALARMI!*\n\nParite: *{a['symbol']}*\nGüncel: *${curr:,.2f}*\nHedef: *${a['target_price']:,.2f}*",
+                    parse_mode="Markdown"
+                )
+                with get_db() as conn:
+                    conn.execute("UPDATE price_alerts SET status = 'DONE' WHERE id = ?", (a["id"],))
+                    conn.commit()
+        except Exception:
+            pass
+
+# -------------------------------------------------------------
+# 8. ÇALIŞTIRMA MOTORU
+# -------------------------------------------------------------
 async def run_bot():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     app = ApplicationBuilder().token(token).build()
 
-    # Komut Kayıtları
+    # Komut bağlamaları
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("piyasa", piyasa))
+    app.add_handler(CommandHandler("hava", hava))
+    app.add_handler(CommandHandler("qr", qr_kod))
+    app.add_handler(CommandHandler("hesapla", hesapla))
     app.add_handler(CommandHandler("hatirlat", hatirlat))
     app.add_handler(CommandHandler("alarm", alarm_command))
-    app.add_handler(CommandHandler("piyasa", piyasa))
-    app.add_handler(CommandHandler("doviz", doviz))
-    app.add_handler(CommandHandler("hava", hava))
     app.add_handler(CommandHandler("not_al", not_al))
     app.add_handler(CommandHandler("notlar", notlar))
     app.add_handler(CommandHandler("gorev_ekle", gorev_ekle))
     app.add_handler(CommandHandler("gorevler", gorevler))
+    app.add_handler(CommandHandler("oto_rapor", oto_rapor_toggle))
     app.add_handler(CommandHandler("yardim", yardim))
-    app.add_handler(CallbackQueryHandler(callback_dispatcher))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_handler))
 
-    # Otonom Arka Plan Taraması (Her 60 saniyede bir fiyat kontrolü yapar)
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    # 45 saniyede bir otonom fiyat kontrolü
     if app.job_queue:
-        app.job_queue.run_repeating(price_watcher_job, interval=60, first=10)
+        app.job_queue.run_repeating(price_alert_worker, interval=45, first=10)
 
     await app.initialize()
     await app.start()
@@ -437,5 +439,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
