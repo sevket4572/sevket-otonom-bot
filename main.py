@@ -368,7 +368,8 @@ async def run_bot():
 
     # Otonom bildirim: Her 6 saatte bir (21600 saniye) selam verip kendini hatırlatır
     if app.job_queue:
-        app.job_queue.run_repeating(periodic_checkin_job, interval=21600, first=3600)
+        app.job_queue.run_repeating(periodic_checkin_job, interval=21600, first=10)
+
 
     await app.initialize()
     await app.start()
