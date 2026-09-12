@@ -4,6 +4,7 @@ import threading
 import sqlite3
 import datetime
 import urllib.parse
+import random
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,13 +18,13 @@ from telegram.ext import (
 )
 
 # -------------------------------------------------------------
-# 1. RENDER PORT VE CANLILIK KORUMASI
+# 1. RENDER PORT & HEALTH CHECK
 # -------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Sekreter Asistan Aktif!")
+        self.wfile.write(b"Sekreter Asistan 7/24 Aktif!")
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
@@ -33,9 +34,9 @@ def start_health_server():
 threading.Thread(target=start_health_server, daemon=True).start()
 
 # -------------------------------------------------------------
-# 2. VERİTABANI
+# 2. VERİTABANI (Kullanıcılar, Notlar, Görevler)
 # -------------------------------------------------------------
-DB_FILE = "sekreter_clean.db"
+DB_FILE = "sekreter_final.db"
 
 def get_db():
     conn = sqlite3.connect(DB_FILE)
@@ -45,6 +46,15 @@ def get_db():
 def init_db():
     with get_db() as conn:
         c = conn.cursor()
+        # Botu başlatan kullanıcıları takip eden tablo
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS active_users (
+                chat_id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                first_name TEXT,
+                last_seen TEXT
+            )
+        """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,8 +75,17 @@ def init_db():
 
 init_db()
 
+def register_user(chat_id, user_id, first_name):
+    now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO active_users (chat_id, user_id, first_name, last_seen) VALUES (?, ?, ?, ?)",
+            (chat_id, user_id, first_name, now)
+        )
+        conn.commit()
+
 # -------------------------------------------------------------
-# 3. VERİ SERVİSLERİ (Döviz, Hava Durumu, Bilgi)
+# 3. VERİ SERVİSLERİ
 # -------------------------------------------------------------
 def fetch_fiat():
     try:
@@ -134,13 +153,18 @@ def get_main_panel():
     ])
 
 # -------------------------------------------------------------
-# 5. KOMUTLAR
+# 5. KOMUT VE İŞLEYİCİLER
 # -------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+    first_name = update.effective_user.first_name or "Dostum"
+    register_user(chat_id, uid, first_name)
+
     text = (
-        "⚡️ *Sekreter Otonom Asistan*\n\n"
-        "Günlük operasyonlar, notlar, alarmlar ve faydalı araçlar hazır. "
-        "Aşağıdaki menüyü veya komutları kullanabilirsiniz."
+        f"⚡️ *Sekreter Otonom Asistan Terminali*\n\n"
+        f"Selam {first_name}! Görevlerin, notların ve operasyonel araçların hazır. "
+        "Aşağıdaki panelden işlemleri yönetebilirsin."
     )
     if update.message:
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_main_panel())
@@ -157,7 +181,7 @@ async def hava(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bilgi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
     if not query:
-        await update.message.reply_text("Kullanım: `/bilgi <konu>`\nÖrn: `/bilgi Yapay zeka`", parse_mode="Markdown")
+        await update.message.reply_text("Kullanım: `/bilgi <konu>`\nÖrn: `/bilgi Atatürk`", parse_mode="Markdown")
         return
     await update.message.reply_text(fetch_wiki(query), parse_mode="Markdown")
 
@@ -173,11 +197,11 @@ async def qr_kod(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def hesapla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     expr = "".join(context.args)
     if not expr:
-        await update.message.reply_text("Kullanım: `/hesapla 1500 * 1.20`", parse_mode="Markdown")
+        await update.message.reply_text("Kullanım: `/hesapla 125 * 8`", parse_mode="Markdown")
         return
     allowed = set("0123456789+-*/()., ")
     if not set(expr).issubset(allowed):
-        await update.message.reply_text("❌ Geçersiz karakter! Sadece temel matematik işlemleri yapılabilir.")
+        await update.message.reply_text("❌ Yalnızca temel matematiksel ifadeler desteklenir.")
         return
     try:
         clean_expr = expr.replace(",", ".")
@@ -202,7 +226,7 @@ async def hatirlat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.job_queue.run_once(hatirlat_callback, saniye, chat_id=update.effective_chat.id, data=mesaj)
         await update.message.reply_text(f"✅ *{dk} dakika* sonra alarm kuruldu:\n🎯 '{mesaj}'", parse_mode="Markdown")
     except (IndexError, ValueError):
-        await update.message.reply_text("Kullanım: `/hatirlat <dakika> <mesaj>`\nÖrn: `/hatirlat 10 Mola bitti`", parse_mode="Markdown")
+        await update.message.reply_text("Kullanım: `/hatirlat <dakika> <mesaj>`\nÖrn: `/hatirlat 10 Su iç`", parse_mode="Markdown")
 
 async def not_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args)
@@ -214,7 +238,7 @@ async def not_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with get_db() as conn:
         conn.execute("INSERT INTO notes (user_id, content, created_at) VALUES (?, ?, ?)", (uid, text, now))
         conn.commit()
-    await update.message.reply_text("📌 Not kalıcı veritabanına kaydedildi!", parse_mode="Markdown")
+    await update.message.reply_text("📌 Not kalıcı olarak kaydedildi!", parse_mode="Markdown")
 
 async def notlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -223,7 +247,7 @@ async def notlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("📌 Kayıtlı notunuz yok.", parse_mode="Markdown")
     else:
-        text = "📌 *Kayıtlı Notlarınız:*\n\n" + "\n".join([f"• {r['content']} _({r['created_at']})_" for r in rows])
+        text = "📌 *Son Notlarınız:*\n\n" + "\n".join([f"• {r['content']} _({r['created_at']})_" for r in rows])
         await update.message.reply_text(text, parse_mode="Markdown")
 
 async def gorev_ekle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -235,7 +259,7 @@ async def gorev_ekle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with get_db() as conn:
         conn.execute("INSERT INTO todos (user_id, task, status) VALUES (?, ?, 'PENDING')", (uid, task))
         conn.commit()
-    await update.message.reply_text("✅ Görev listenize eklendi!", parse_mode="Markdown")
+    await update.message.reply_text("✅ Görev eklendi!", parse_mode="Markdown")
 
 async def render_todos(message, uid):
     with get_db() as conn:
@@ -251,16 +275,16 @@ async def gorevler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def yardim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "📖 *Sekreter Asistan Araçları:*\n\n"
-        "• `/start` - Ana butonlu paneli açar\n"
-        "• `/doviz` - Güncel döviz kurlarını getirir\n"
+        "📖 *Sekreter Asistan Komutları:*\n\n"
+        "• `/start` - Kontrol panelini açar\n"
+        "• `/doviz` - Güncel piyasa döviz kurları\n"
         "• `/hava <şehir>` - Şehir hava durumu raporu\n"
-        "• `/bilgi <konu>` - Wikipedia'dan anında bilgi özeti çeker\n"
+        "• `/bilgi <konu>` - Wikipedia hızlı özeti\n"
         "• `/hatirlat <dk> <mesaj>` - Geri sayım alarmı kurar\n"
-        "• `/qr <yazı veya link>` - Hızlı QR kod görseli oluşturur\n"
-        "• `/hesapla <işlem>` - Matematiksel hesaplayıcı\n"
+        "• `/qr <yazı veya link>` - Taranabilir karekod üretir\n"
+        "• `/hesapla <işlem>` - Hızlı hesap makinesi\n"
         "• `/not_al <not>` & `/notlar` - Kalıcı not yöneticisi\n"
-        "• `/gorev_ekle <iş>` & `/gorevler` - Etkileşimli görev listesi"
+        "• `/gorev_ekle <iş>` & `/gorevler` - Butonlu görev listesi"
     )
     if update.message:
         await update.message.reply_text(text, parse_mode="Markdown")
@@ -292,10 +316,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render_todos(query.message, uid)
 
 async def echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_chat.id, update.effective_user.id, update.effective_user.first_name or "Dostum")
     await update.message.reply_text("⚙️ İşlem yapmak için menüyü veya `/yardim` komutunu kullanabilirsiniz.", reply_markup=get_main_panel())
 
 # -------------------------------------------------------------
-# 6. MOTOR
+# 6. OTONOM SELAM & HATIRLATMA MOTORU (BACKGROUND WORKER)
+# -------------------------------------------------------------
+async def periodic_checkin_job(context: ContextTypes.DEFAULT_TYPE):
+    """Kullanıcılara periyodik olarak kendini hatırlatır."""
+    messages = [
+        "👋 Selam! Arada bir kendimi hatırlatayım dedim, yardımcı olabileceğim bir iş veya not var mı?",
+        "⚡️ Merhaba! Görev listeni kontrol etmek veya yeni bir hatırlatıcı kurmak ister misin?",
+        "🤖 Selam! Sistemler aktif, her şey yolunda. Bir komut veya hesaplama gerekirse buradayım."
+    ]
+    with get_db() as conn:
+        users = conn.execute("SELECT chat_id, first_name FROM active_users").fetchall()
+    
+    for user in users:
+        try:
+            msg = random.choice(messages)
+            await context.bot.send_message(
+                chat_id=user["chat_id"],
+                text=msg,
+                reply_markup=get_main_panel()
+            )
+        except Exception:
+            pass
+
+# -------------------------------------------------------------
+# 7. MOTOR
 # -------------------------------------------------------------
 async def run_bot():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -317,6 +366,10 @@ async def run_bot():
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_handler))
 
+    # Otonom bildirim: Her 6 saatte bir (21600 saniye) selam verip kendini hatırlatır
+    if app.job_queue:
+        app.job_queue.run_repeating(periodic_checkin_job, interval=21600, first=3600)
+
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
@@ -334,3 +387,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
